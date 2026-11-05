@@ -1,0 +1,600 @@
+--[[
+	LoL Pannel (Luau / Roblox)
+	Tipo: LocalScript
+	Local: StarterPlayer > StarterPlayerScripts
+
+	Recursos:
+	  1. Painel compacto, arrastável, com botão flutuante
+	  2. Botões de mensagem (digite + Enter) que enviam ao chat
+	  3. Modo de edição (selecionar, mover, apagar)
+	  4. ESP (Highlight vermelho + nome)
+	  5. ShiftLock (painel ou Shift) com "+" central
+	  6. Setas direcionais (movimento contínuo relativo à câmera)
+	  7. Responsividade (UIScale + posições em escala)
+
+	Tudo é local ao cliente, exceto o chat, que usa o sistema oficial do Roblox
+	(TextChatService / chat legado), validado e filtrado pelo servidor.
+]]
+
+--------------------------------------------------------------------------------
+-- Serviços
+--------------------------------------------------------------------------------
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TextChatService = game:GetService("TextChatService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+--------------------------------------------------------------------------------
+-- Configuração
+--------------------------------------------------------------------------------
+local GUI_NAME = "LoLPannel"
+local RENDER_SHIFTLOCK = "LoLPannel_ShiftLock"
+local RENDER_MOVE = "LoLPannel_Move"
+local ESP_FOLDER_NAME = "LoLPannel_ESP"
+
+local CONFIG = {
+	MAX_MESSAGES = 20,
+	MAX_MESSAGE_LENGTH = 200,
+	LABEL_MAX_LENGTH = 28,
+	SEND_COOLDOWN = 0.75,
+	DRAG_THRESHOLD = 8,
+	SHIFTLOCK_OFFSET = Vector3.new(1.75, 0, 0),
+	SHIFTLOCK_KEYS = {
+		[Enum.KeyCode.LeftShift] = true,
+		[Enum.KeyCode.RightShift] = true,
+	},
+}
+
+local COLORS = {
+	background = Color3.fromRGB(24, 24, 30),
+	surface = Color3.fromRGB(42, 42, 52),
+	off = Color3.fromRGB(62, 62, 74),
+	on = Color3.fromRGB(46, 160, 90),
+	accent = Color3.fromRGB(200, 45, 45),
+	danger = Color3.fromRGB(190, 50, 50),
+	disabled = Color3.fromRGB(70, 70, 80),
+	text = Color3.fromRGB(255, 255, 255),
+	subtext = Color3.fromRGB(170, 170, 185),
+	edit = Color3.fromRGB(255, 170, 40),
+	selected = Color3.fromRGB(90, 230, 130),
+	message = Color3.fromRGB(35, 35, 45),
+	arrowIdle = Color3.fromRGB(30, 30, 38),
+	arrowActive = Color3.fromRGB(200, 45, 45),
+}
+
+--------------------------------------------------------------------------------
+-- Limpeza de instâncias anteriores (evita duplicação se o script rodar de novo)
+--------------------------------------------------------------------------------
+do
+	local oldGui = playerGui:FindFirstChild(GUI_NAME)
+	if oldGui then
+		oldGui:Destroy()
+	end
+	local oldEsp = workspace:FindFirstChild(ESP_FOLDER_NAME)
+	if oldEsp then
+		oldEsp:Destroy()
+	end
+	pcall(function()
+		RunService:UnbindFromRenderStep(RENDER_SHIFTLOCK)
+	end)
+	pcall(function()
+		RunService:UnbindFromRenderStep(RENDER_MOVE)
+	end)
+end
+
+--------------------------------------------------------------------------------
+-- Estado global
+--------------------------------------------------------------------------------
+local State = {
+	panelOpen = false,
+	editMode = false,
+	espEnabled = false,
+	shiftLock = false,
+	arrowsVisible = true,
+}
+
+local UI = {} -- referências de interface preenchidas mais abaixo
+
+-- Declarações antecipadas (definidas depois)
+local setStatus
+local refreshDeleteButton
+
+--------------------------------------------------------------------------------
+-- Utilitários
+--------------------------------------------------------------------------------
+local function create(className, props, children)
+	local inst = Instance.new(className)
+	for key, value in pairs(props) do
+		if key ~= "Parent" then
+			inst[key] = value
+		end
+	end
+	if children then
+		for _, child in ipairs(children) do
+			child.Parent = inst
+		end
+	end
+	if props.Parent then
+		inst.Parent = props.Parent
+	end
+	return inst
+end
+
+local function addCorner(parent, radius)
+	return create("UICorner", { CornerRadius = UDim.new(0, radius), Parent = parent })
+end
+
+local function trim(text)
+	return (text:match("^%s*(.-)%s*$"))
+end
+
+local function truncate(text, maxChars, suffix)
+	local length = utf8.len(text)
+	if not length then
+		-- texto com bytes inválidos: corta por bytes de forma segura
+		return text:sub(1, maxChars)
+	end
+	if length <= maxChars then
+		return text
+	end
+	local byteIndex = utf8.offset(text, maxChars + 1)
+	return text:sub(1, byteIndex - 1) .. (suffix or "")
+end
+
+local function isPointerInput(input)
+	local t = input.UserInputType
+	return t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch
+end
+
+--------------------------------------------------------------------------------
+-- ScreenGui raiz
+--------------------------------------------------------------------------------
+local screenGui = create("ScreenGui", {
+	Name = GUI_NAME,
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	DisplayOrder = 50,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	Parent = playerGui,
+})
+
+--------------------------------------------------------------------------------
+-- Módulo: Escala responsiva
+--------------------------------------------------------------------------------
+local scaleObjects = {}
+
+local function computeScale()
+	local camera = workspace.CurrentCamera
+	local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
+	return math.clamp(math.min(viewport.X, viewport.Y) / 640, 0.75, 1.4)
+end
+
+local function registerScale(guiObject)
+	local scale = create("UIScale", { Scale = computeScale(), Parent = guiObject })
+	table.insert(scaleObjects, scale)
+	return scale
+end
+
+local function refreshScale()
+	local value = computeScale()
+	for i = #scaleObjects, 1, -1 do
+		local scale = scaleObjects[i]
+		if scale.Parent then
+			scale.Scale = value
+		else
+			table.remove(scaleObjects, i)
+		end
+	end
+end
+
+local viewportConnection
+local function watchCamera()
+	if viewportConnection then
+		viewportConnection:Disconnect()
+		viewportConnection = nil
+	end
+	local camera = workspace.CurrentCamera
+	if camera then
+		viewportConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(refreshScale)
+		refreshScale()
+	end
+end
+workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(watchCamera)
+watchCamera()
+
+--------------------------------------------------------------------------------
+-- Módulo: Arrastar (mouse e toque)
+-- Os alvos usam AnchorPoint 0.5/0.5 e Position apenas em escala, por isso a
+-- posição independe do UIScale e da resolução.
+--------------------------------------------------------------------------------
+local function makeDraggable(handle, target, options)
+	options = options or {}
+	local activeInput = nil
+	local startPoint = nil
+	local startPosition = nil
+	local moved = false
+
+	handle.InputBegan:Connect(function(input)
+		if not isPointerInput(input) or activeInput then
+			return
+		end
+		activeInput = input
+		startPoint = input.Position
+		startPosition = target.Position
+		moved = false
+
+		if options.onPress then
+			options.onPress()
+		end
+
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End and activeInput == input then
+				activeInput = nil
+				if options.onRelease then
+					options.onRelease(moved)
+				end
+			end
+		end)
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if not activeInput then
+			return
+		end
+		if activeInput.UserInputType == Enum.UserInputType.Touch then
+			if input ~= activeInput then
+				return
+			end
+		elseif input.UserInputType ~= Enum.UserInputType.MouseMovement then
+			return
+		end
+
+		local delta = input.Position - startPoint
+		if not moved and delta.Magnitude >= CONFIG.DRAG_THRESHOLD then
+			moved = true
+		end
+
+		if moved and (not options.canDrag or options.canDrag()) then
+			local size = screenGui.AbsoluteSize
+			if size.X <= 0 or size.Y <= 0 then
+				return
+			end
+			local halfX = math.min(target.AbsoluteSize.X / 2 / size.X, 0.5)
+			local halfY = math.min(target.AbsoluteSize.Y / 2 / size.Y, 0.5)
+			local x = math.clamp(startPosition.X.Scale + delta.X / size.X, halfX, 1 - halfX)
+			local y = math.clamp(startPosition.Y.Scale + delta.Y / size.Y, halfY, 1 - halfY)
+			target.Position = UDim2.fromScale(x, y)
+		end
+	end)
+end
+
+--------------------------------------------------------------------------------
+-- Módulo: Chat
+--------------------------------------------------------------------------------
+local function sendChat(text)
+	local ok = pcall(function()
+		if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+			local channels = TextChatService:WaitForChild("TextChannels", 3)
+			local channel = channels and channels:WaitForChild("RBXGeneral", 3)
+			if not channel then
+				error("canal indisponivel")
+			end
+			channel:SendAsync(text)
+		else
+			local events = ReplicatedStorage:WaitForChild("DefaultChatSystemChatEvents", 3)
+			local say = events and events:WaitForChild("SayMessageRequest", 3)
+			if not say then
+				error("chat legado indisponivel")
+			end
+			say:FireServer(text, "All")
+		end
+	end)
+	return ok
+end
+
+
+--------------------------------------------------------------------------------
+-- Módulo: Painel
+--------------------------------------------------------------------------------
+local panel = create("Frame", {
+	Name = "Panel",
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(250, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundColor3 = COLORS.background,
+	BackgroundTransparency = 0.05,
+	Visible = false,
+	ZIndex = 10,
+	Parent = screenGui,
+})
+addCorner(panel, 14)
+create("UIStroke", {
+	Color = COLORS.accent,
+	Thickness = 2,
+	ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	Parent = panel,
+})
+create("UIPadding", {
+	PaddingTop = UDim.new(0, 8),
+	PaddingBottom = UDim.new(0, 8),
+	PaddingLeft = UDim.new(0, 8),
+	PaddingRight = UDim.new(0, 8),
+	Parent = panel,
+})
+create("UIListLayout", {
+	Padding = UDim.new(0, 6),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	HorizontalAlignment = Enum.HorizontalAlignment.Center,
+	Parent = panel,
+})
+registerScale(panel)
+
+local floatingButton -- definido abaixo
+
+local function setPanelOpen(open)
+	State.panelOpen = open
+	panel.Visible = open
+	if floatingButton then
+		floatingButton.BackgroundColor3 = open and COLORS.accent or COLORS.background
+	end
+end
+
+-- Barra de título (alça de arrasto + botão fechar)
+local titleRow = create("Frame", {
+	Name = "TitleRow",
+	LayoutOrder = 1,
+	Size = UDim2.new(1, 0, 0, 34),
+	BackgroundTransparency = 1,
+	Parent = panel,
+})
+local titleLabel = create("TextLabel", {
+	Name = "Title",
+	Size = UDim2.new(1, -40, 1, 0),
+	BackgroundColor3 = COLORS.surface,
+	Text = "LoL Pannel",
+	TextColor3 = COLORS.text,
+	TextSize = 16,
+	Font = Enum.Font.GothamBold,
+	Active = true,
+	Parent = titleRow,
+})
+addCorner(titleLabel, 8)
+local closeButton = create("TextButton", {
+	Name = "Close",
+	Position = UDim2.new(1, -34, 0, 0),
+	Size = UDim2.fromOffset(34, 34),
+	BackgroundColor3 = COLORS.danger,
+	Text = "X",
+	TextColor3 = COLORS.text,
+	TextSize = 16,
+	Font = Enum.Font.GothamBold,
+	AutoButtonColor = true,
+	Parent = titleRow,
+})
+addCorner(closeButton, 8)
+closeButton.Activated:Connect(function()
+	setPanelOpen(false)
+end)
+makeDraggable(titleLabel, panel)
+
+-- Campo de texto para criar botões de mensagem
+local messageBox = create("TextBox", {
+	Name = "MessageBox",
+	LayoutOrder = 2,
+	Size = UDim2.new(1, 0, 0, 36),
+	BackgroundColor3 = COLORS.surface,
+	Text = "",
+	PlaceholderText = "Digite a frase e pressione Enter",
+	PlaceholderColor3 = COLORS.subtext,
+	TextColor3 = COLORS.text,
+	TextSize = 14,
+	Font = Enum.Font.Gotham,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ClearTextOnFocus = false,
+	Parent = panel,
+})
+addCorner(messageBox, 8)
+create("UIPadding", {
+	PaddingLeft = UDim.new(0, 8),
+	PaddingRight = UDim.new(0, 8),
+	Parent = messageBox,
+})
+messageBox.FocusLost:Connect(function(enterPressed)
+	if not enterPressed then
+		return
+	end
+	if addMessage(messageBox.Text) then
+		messageBox.Text = ""
+	end
+end)
+
+-- Grade de botões liga/desliga
+local toggleGrid = create("Frame", {
+	Name = "Toggles",
+	LayoutOrder = 3,
+	Size = UDim2.new(1, 0, 0, 78),
+	BackgroundTransparency = 1,
+	Parent = panel,
+})
+create("UIGridLayout", {
+	CellSize = UDim2.new(0.5, -3, 0, 36),
+	CellPadding = UDim2.fromOffset(6, 6),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	Parent = toggleGrid,
+})
+
+local function createToggle(label, order, initial, callback)
+	local state = initial
+	local button = create("TextButton", {
+		Name = "Toggle_" .. label,
+		LayoutOrder = order,
+		BackgroundColor3 = COLORS.off,
+		Text = "",
+		TextColor3 = COLORS.text,
+		TextScaled = true,
+		Font = Enum.Font.GothamBold,
+		AutoButtonColor = false,
+		Parent = toggleGrid,
+	})
+	addCorner(button, 8)
+	create("UITextSizeConstraint", { MaxTextSize = 14, MinTextSize = 8, Parent = button })
+	create("UIPadding", {
+		PaddingLeft = UDim.new(0, 4),
+		PaddingRight = UDim.new(0, 4),
+		Parent = button,
+	})
+
+	local function render()
+		button.Text = label .. (state and " ON" or " OFF")
+		button.BackgroundColor3 = state and COLORS.on or COLORS.off
+	end
+	render()
+
+	button.Activated:Connect(function()
+		state = not state
+		render()
+		callback(state)
+	end)
+
+	return {
+		Set = function(value)
+			state = value
+			render()
+		end,
+	}
+end
+
+UI.espToggle = createToggle("ESP", 1, State.espEnabled, setESP)
+UI.shiftToggle = createToggle("ShiftLock", 2, State.shiftLock, setShiftLock)
+UI.arrowsToggle = createToggle("Setas", 3, State.arrowsVisible, setArrowsVisible)
+UI.editToggle = createToggle("Editar", 4, State.editMode, setEditMode)
+
+-- Botão apagar selecionado
+UI.deleteButton = create("TextButton", {
+	Name = "DeleteSelected",
+	LayoutOrder = 4,
+	Size = UDim2.new(1, 0, 0, 34),
+	BackgroundColor3 = COLORS.disabled,
+	Text = "Apagar selecionado",
+	TextColor3 = COLORS.text,
+	TextSize = 14,
+	Font = Enum.Font.GothamBold,
+	AutoButtonColor = false,
+	Parent = panel,
+})
+addCorner(UI.deleteButton, 8)
+UI.deleteButton.Activated:Connect(deleteSelected)
+
+refreshDeleteButton = function()
+	local enabled = State.editMode and selectedEntry ~= nil
+	UI.deleteButton.BackgroundColor3 = enabled and COLORS.danger or COLORS.disabled
+	UI.deleteButton.TextTransparency = enabled and 0 or 0.5
+end
+refreshDeleteButton()
+
+-- Linha de status
+UI.status = create("TextLabel", {
+	Name = "Status",
+	LayoutOrder = 5,
+	Size = UDim2.new(1, 0, 0, 18),
+	BackgroundTransparency = 1,
+	Text = "Pronto",
+	TextColor3 = COLORS.subtext,
+	TextSize = 12,
+	Font = Enum.Font.Gotham,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	Parent = panel,
+})
+setStatus = function(text)
+	UI.status.Text = text
+end
+
+-- Dica de uso
+create("TextLabel", {
+	Name = "Hint",
+	LayoutOrder = 6,
+	Size = UDim2.new(1, 0, 0, 40),
+	BackgroundTransparency = 1,
+	Text = "Shift: ShiftLock. Segure Ctrl para liberar o mouse. Edição: toque para selecionar, arraste para mover, Delete apaga.",
+	TextColor3 = COLORS.subtext,
+	TextSize = 11,
+	Font = Enum.Font.Gotham,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+	Parent = panel,
+})
+
+
+--------------------------------------------------------------------------------
+-- Botão flutuante (abre/fecha o painel; também é arrastável)
+--------------------------------------------------------------------------------
+floatingButton = create("TextButton", {
+	Name = "FloatingToggle",
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.06, 0.35),
+	Size = UDim2.fromOffset(52, 52),
+	BackgroundColor3 = COLORS.background,
+	BackgroundTransparency = 0.05,
+	Text = "LoL",
+	TextColor3 = COLORS.text,
+	TextSize = 16,
+	Font = Enum.Font.GothamBold,
+	AutoButtonColor = false,
+	Active = true,
+	ZIndex = 11,
+	Parent = screenGui,
+})
+addCorner(floatingButton, 26)
+create("UIStroke", {
+	Color = COLORS.accent,
+	Thickness = 2,
+	ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	Parent = floatingButton,
+})
+registerScale(floatingButton)
+makeDraggable(floatingButton, floatingButton, {
+	onRelease = function(moved)
+		if not moved then
+			setPanelOpen(not State.panelOpen)
+		end
+	end,
+})
+
+--------------------------------------------------------------------------------
+-- Entrada de teclado
+--------------------------------------------------------------------------------
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then
+		return
+	end
+	if CONFIG.SHIFTLOCK_KEYS[input.KeyCode] then
+		setShiftLock(not State.shiftLock)
+	elseif input.KeyCode == Enum.KeyCode.Delete or input.KeyCode == Enum.KeyCode.Backspace then
+		deleteSelected()
+	end
+end)
+
+--------------------------------------------------------------------------------
+-- Respawn / morte do personagem
+--------------------------------------------------------------------------------
+local function onCharacterAdded()
+	clearArrowInputs()
+	-- O passo do ShiftLock reaplica AutoRotate/CameraOffset ao novo personagem
+end
+
+LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
+LocalPlayer.CharacterRemoving:Connect(function()
+	clearArrowInputs()
+end)
+
+--------------------------------------------------------------------------------
+-- Inicialização
+--------------------------------------------------------------------------------
+setPanelOpen(false)
